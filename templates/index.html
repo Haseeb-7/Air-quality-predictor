@@ -1,0 +1,1008 @@
+{# prediction_text is sent only by the /predict route; on the first GET it is undefined #}
+{% set has_result = prediction_text is defined and prediction_text %}
+{% set is_good = has_result and ('good' in prediction_text|lower) %}
+{% set state = ('good' if is_good else 'poor') if has_result else 'idle' %}
+
+{# name (must match request.form keys in Flask), short label, full label, description, slider max (UI only), slider step (UI only) #}
+{% set fields = [
+  ('pm10',                  'PM10',  'PM10',                  'Inhalable particles up to 10 micrometres across, from dust, construction and road traffic.', 500, 1),
+  ('pm2_5',                 'PM2.5', 'PM2.5',                 'Fine particles up to 2.5 micrometres across. They reach deep into the lungs and come mostly from combustion.', 300, 1),
+  ('carbon_monoxide',       'CO',    'Carbon monoxide',       'A colourless gas produced by incomplete burning of fuel, mainly from vehicles.', 5000, 10),
+  ('nitrogen_dioxide',      'NO2',   'Nitrogen dioxide',      'Produced by traffic and combustion. It irritates the airways.', 200, 1),
+  ('sulphur_dioxide',       'SO2',   'Sulphur dioxide',       'Released by burning coal and oil and by industrial processes.', 200, 1),
+  ('ozone',                 'O3',    'Ozone',                 'At ground level it forms when sunlight reacts with other pollutants.', 300, 1),
+  ('aerosol_optical_depth', 'AOD',   'Aerosol optical depth', 'How much airborne particles block sunlight through the atmosphere. Higher means hazier.', 3, 0.01),
+  ('dust',                  'Dust',  'Dust',                  'Concentration of airborne mineral dust.', 500, 1),
+  ('uv_index',              'UV',    'UV index',              'Strength of ultraviolet radiation from the sun at the surface.', 12, 0.1)
+] %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Air Quality Check</title>
+
+  <!-- Apply saved or system theme before first paint to avoid a flash -->
+  <script>
+  {% raw %}
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("aqi-theme"); } catch (e) {}
+      if (!t) { t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"; }
+      document.documentElement.setAttribute("data-theme", t);
+    })();
+  {% endraw %}
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    /* ---------- Tokens ---------- */
+    :root {
+      --bg: #f1f5f3;
+      --surface: #ffffff;
+      --surface-2: #f6f9f7;
+      --ink: #10201b;
+      --ink-soft: #52645d;
+      --line: #d7e1dc;
+      --idle: #2f80ed;
+      --good: #0f9d68;
+      --poor: #e2572b;
+      --warn: #c78a00;
+      --accent: var(--idle);
+      --shadow: 0 1px 2px rgba(16, 32, 27, 0.06), 0 10px 30px rgba(16, 32, 27, 0.07);
+      --radius: 16px;
+      --font-body: "Instrument Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+    }
+
+    :root[data-theme="dark"] {
+      --bg: #08110e;
+      --surface: #101d19;
+      --surface-2: #15261f;
+      --ink: #e8f1ed;
+      --ink-soft: #9bb0a7;
+      --line: #234036;
+      --idle: #5aa2ff;
+      --good: #43d39d;
+      --poor: #ff8a62;
+      --warn: #f0bd44;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+
+    body[data-state="good"]  { --accent: var(--good); }
+    body[data-state="poor"]  { --accent: var(--poor); }
+    body[data-state="error"] { --accent: var(--warn); }
+
+    /* ---------- Base ---------- */
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    h1, h2, h3, p { margin: 0; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--font-body);
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+      transition: background 0.4s;
+    }
+
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+
+    #bg {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    .container { position: relative; z-index: 1; width: min(1200px, 100% - 2rem); margin-inline: auto; }
+
+    /* ---------- Header ---------- */
+    .site-header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      background: color-mix(in srgb, var(--bg) 78%, transparent);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .site-header .container { display: flex; align-items: center; gap: 1.25rem; padding-block: 0.75rem; }
+
+    .brand { display: flex; align-items: center; gap: 0.6rem; text-decoration: none; color: var(--ink); }
+    .brand svg { color: var(--accent); transition: color 0.4s; }
+    .brand span { font-family: var(--font-display); font-size: 1.25rem; }
+
+    .nav { margin-left: auto; display: flex; gap: 0.25rem; }
+    .nav a {
+      color: var(--ink-soft);
+      text-decoration: none;
+      font-size: 0.925rem;
+      font-weight: 500;
+      padding: 0.4rem 0.8rem;
+      border-radius: 99px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .nav a:hover { background: var(--surface); color: var(--ink); }
+
+    .icon-btn {
+      display: grid;
+      place-items: center;
+      width: 2.4rem;
+      height: 2.4rem;
+      border-radius: 50%;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .icon-btn:hover { transform: rotate(18deg); border-color: var(--accent); }
+    .icon-sun { display: none; }
+    :root[data-theme="dark"] .icon-sun { display: block; }
+    :root[data-theme="dark"] .icon-moon { display: none; }
+
+    @media (max-width: 640px) { .nav { display: none; } .icon-btn { margin-left: auto; } }
+
+    /* ---------- Hero ---------- */
+    .hero { padding-block: 3rem 2rem; max-width: 46rem; }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 0.9rem;
+      transition: color 0.4s;
+    }
+    .eyebrow::before { content: ""; width: 1.6rem; height: 2px; background: currentColor; }
+
+    .hero h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2.2rem, 5.5vw, 3.75rem);
+      line-height: 1.08;
+      margin-bottom: 1rem;
+    }
+    .hero h1 em {
+      font-style: normal;
+      background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 45%, var(--ink)));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .hero p { color: var(--ink-soft); font-size: 1.075rem; max-width: 40rem; }
+
+    /* ---------- Workspace ---------- */
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(300px, 1fr);
+      gap: 1.5rem;
+      align-items: start;
+      padding-bottom: 3rem;
+    }
+    @media (max-width: 980px) { .workspace { grid-template-columns: 1fr; } }
+
+    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+    .section-head h2 { font-size: 1.25rem; }
+    .section-head p { color: var(--ink-soft); font-size: 0.9rem; }
+
+    /* ---------- Field cards ---------- */
+    .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1rem; }
+
+    .field {
+      --mx: 50%;
+      --my: 50%;
+      position: relative;
+      overflow: hidden;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem 1.15rem;
+      box-shadow: var(--shadow);
+      transition: border-color 0.2s, transform 0.2s;
+      animation: rise 0.5s ease both;
+      animation-delay: calc(var(--i) * 45ms);
+    }
+    .field::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(180px circle at var(--mx) var(--my), color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%);
+      opacity: 0;
+      transition: opacity 0.25s;
+      pointer-events: none;
+    }
+    .field:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+    .field:hover::before { opacity: 1; }
+    .field.filled { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+    .field.invalid { border-color: var(--poor); animation: shake 0.35s; }
+
+    .field-top { position: relative; display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; }
+
+    .chip {
+      min-width: 2.6rem;
+      text-align: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.2rem 0.5rem;
+      border-radius: 8px;
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+      transition: color 0.4s, background 0.4s;
+    }
+
+    .field label { font-weight: 600; font-size: 0.95rem; flex: 1; }
+
+    .info-btn {
+      width: 1.5rem;
+      height: 1.5rem;
+      border-radius: 50%;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--ink-soft);
+      font: italic 600 0.8rem var(--font-display);
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+    .info-btn:hover, .info-btn[aria-expanded="true"] { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+
+    .info { position: relative; font-size: 0.85rem; color: var(--ink-soft); margin-bottom: 0.7rem; animation: rise 0.25s ease; }
+
+    .num {
+      position: relative;
+      width: 100%;
+      padding: 0.35rem 0;
+      font: 600 1.75rem var(--font-body);
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+      background: transparent;
+      border: 0;
+      border-bottom: 2px solid var(--line);
+      transition: border-color 0.2s;
+    }
+    .num::placeholder { color: var(--line); }
+    .num:focus { outline: none; border-bottom-color: var(--accent); }
+    .num::-webkit-outer-spin-button, .num::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .num { -moz-appearance: textfield; appearance: textfield; }
+
+    .slider {
+      position: relative;
+      -webkit-appearance: none;
+      appearance: none;
+      display: block;
+      width: 100%;
+      height: 6px;
+      margin: 1.1rem 0 0.2rem;
+      border-radius: 99px;
+      background: linear-gradient(to right, var(--accent) var(--pct, 0%), var(--line) var(--pct, 0%));
+      cursor: pointer;
+    }
+    .slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 3px solid var(--accent);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+      transition: transform 0.15s;
+    }
+    .slider::-moz-range-thumb {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 3px solid var(--accent);
+    }
+    .slider:hover::-webkit-slider-thumb { transform: scale(1.2); }
+
+    .scale { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--ink-soft); position: relative; }
+
+    .form-msg { margin-top: 1rem; color: var(--poor); font-weight: 500; }
+
+    /* ---------- Side panel ---------- */
+    .panel { display: grid; gap: 1rem; }
+    @media (min-width: 981px) and (min-height: 860px) { .panel { position: sticky; top: 4.75rem; } }
+
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 1.25rem; }
+
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+    .btn {
+      font: 600 0.95rem var(--font-body);
+      padding: 0.75rem 1rem;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      transition: transform 0.1s, background 0.15s, border-color 0.15s, filter 0.15s;
+    }
+    .btn:hover { border-color: var(--accent); }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary {
+      grid-column: 1 / -1;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      padding: 0.95rem 1rem;
+      font-size: 1.05rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.6rem;
+    }
+    body[data-state="error"] .btn-primary { color: #1b1300; }
+    .btn-primary:hover { filter: brightness(1.08); }
+    .btn-primary[disabled] { cursor: progress; filter: saturate(0.7); }
+
+    .spinner { display: none; width: 1rem; height: 1rem; border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.4); border-top-color: #fff; animation: spin 0.7s linear infinite; }
+    .loading .spinner { display: inline-block; }
+
+    /* Result */
+    .result { display: grid; grid-template-columns: 96px 1fr; gap: 1.1rem; align-items: center; border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); transition: border-color 0.4s; }
+    .result.pop { animation: pop 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.3); }
+
+    .ring { width: 96px; height: 96px; }
+    .ring-track { fill: none; stroke: var(--line); stroke-width: 8; }
+    .ring-fg {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 8;
+      stroke-linecap: round;
+      stroke-dasharray: 327;
+      stroke-dashoffset: calc(327 * (1 - var(--p, 0)));
+      transform: rotate(-90deg);
+      transform-origin: 60px 60px;
+      transition: stroke-dashoffset 0.9s cubic-bezier(0.3, 0.7, 0.2, 1), stroke 0.4s;
+    }
+    body:not([data-state="idle"]) .ring-fg { stroke-dashoffset: 0; }
+
+    .ic { display: none; fill: none; stroke: var(--accent); stroke-width: 6; stroke-linecap: round; stroke-linejoin: round; }
+    body[data-state="idle"]  .ic-idle,
+    body[data-state="good"]  .ic-good,
+    body[data-state="poor"]  .ic-poor,
+    body[data-state="error"] .ic-poor { display: block; }
+
+    .result-label { font-size: 0.78rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-soft); }
+    .verdict { font-family: var(--font-display); font-size: clamp(2rem, 4.5vw, 2.6rem); line-height: 1.1; color: var(--accent); transition: color 0.4s; }
+    .result-text { font-size: 0.9rem; color: var(--ink-soft); margin-top: 0.3rem; }
+    .result-meta { font-size: 0.78rem; color: var(--ink-soft); margin-top: 0.5rem; }
+    .result-meta b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+    /* Radar */
+    .radar-wrap { position: relative; }
+    .radar-wrap h2 { font-size: 1rem; margin-bottom: 0.1rem; }
+    .radar-wrap .sub { font-size: 0.82rem; color: var(--ink-soft); }
+    #radar { display: block; width: 100%; max-width: 320px; margin: 0.25rem auto 0; overflow: visible; }
+    .r-grid { fill: none; stroke: var(--line); stroke-width: 1; }
+    .r-axis { stroke: var(--line); stroke-width: 1; }
+    .r-label { fill: var(--ink-soft); font: 600 10px var(--font-body); }
+    .r-poly { fill: color-mix(in srgb, var(--accent) 22%, transparent); stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; transition: stroke 0.4s, fill 0.4s; }
+    .r-dot { fill: var(--surface); stroke: var(--accent); stroke-width: 2; }
+    .scanning .r-poly { animation: pulse 0.9s ease-in-out infinite; }
+
+    /* ---------- Sections below ---------- */
+    .block { padding-block: 2.5rem; border-top: 1px solid var(--line); }
+
+    .history-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.85rem; }
+    .h-item { display: grid; gap: 0.35rem; padding: 1rem; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); animation: rise 0.4s ease both; }
+    .h-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+    .badge { font-size: 0.78rem; font-weight: 700; padding: 0.2rem 0.65rem; border-radius: 99px; }
+    .badge.good { color: var(--good); background: color-mix(in srgb, var(--good) 15%, transparent); }
+    .badge.poor { color: var(--poor); background: color-mix(in srgb, var(--poor) 15%, transparent); }
+    .h-time { font-size: 0.8rem; color: var(--ink-soft); }
+    .h-vals { font-size: 0.85rem; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+    .link-btn { justify-self: start; background: none; border: 0; padding: 0; font: 600 0.85rem var(--font-body); color: var(--accent); cursor: pointer; }
+    .link-btn:hover { text-decoration: underline; }
+    .empty { color: var(--ink-soft); padding: 1.5rem; border: 1px dashed var(--line); border-radius: 14px; }
+
+    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; counter-reset: s; margin-bottom: 1.5rem; }
+    .step { counter-increment: s; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 1.1rem 1.2rem; box-shadow: var(--shadow); }
+    .step::before { content: counter(s); display: grid; place-items: center; width: 1.8rem; height: 1.8rem; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; font-size: 0.85rem; margin-bottom: 0.6rem; transition: background 0.4s; }
+    .step h3 { font-size: 1rem; margin-bottom: 0.25rem; }
+    .step p { font-size: 0.9rem; color: var(--ink-soft); }
+
+    .outcomes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+    .outcome { border-radius: 14px; padding: 1.25rem; border: 1px solid; transition: transform 0.2s; }
+    .outcome:hover { transform: translateY(-3px); }
+    .outcome h3 { font-family: var(--font-display); font-size: 1.6rem; margin-bottom: 0.3rem; }
+    .outcome p { font-size: 0.92rem; color: var(--ink-soft); }
+    .outcome.good { border-color: color-mix(in srgb, var(--good) 50%, var(--line)); background: color-mix(in srgb, var(--good) 9%, var(--surface)); }
+    .outcome.good h3 { color: var(--good); }
+    .outcome.poor { border-color: color-mix(in srgb, var(--poor) 50%, var(--line)); background: color-mix(in srgb, var(--poor) 9%, var(--surface)); }
+    .outcome.poor h3 { color: var(--poor); }
+
+    .site-footer { border-top: 1px solid var(--line); padding-block: 1.5rem; font-size: 0.875rem; color: var(--ink-soft); }
+
+    .reveal { opacity: 0; transform: translateY(14px); transition: opacity 0.6s, transform 0.6s; }
+    .reveal.in { opacity: 1; transform: none; }
+
+    /* ---------- Animations ---------- */
+    @keyframes rise  { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+    @keyframes pop   { 0% { transform: scale(0.96); } 100% { transform: scale(1); } }
+    @keyframes spin  { to { transform: rotate(360deg); } }
+    @keyframes pulse { 50% { opacity: 0.45; } }
+    @keyframes shake { 20%, 60% { transform: translateX(-5px); } 40%, 80% { transform: translateX(5px); } }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+      html { scroll-behavior: auto; }
+      .reveal { opacity: 1; transform: none; }
+    }
+
+    @media (max-width: 480px) {
+      .result { grid-template-columns: 1fr; justify-items: start; }
+    }
+  </style>
+</head>
+
+<body data-state="{{ state }}">
+  <canvas id="bg" aria-hidden="true"></canvas>
+
+  <header class="site-header">
+    <div class="container">
+      <a class="brand" href="#top" aria-label="Air Quality Check home">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9.59 4.59A2 2 0 1 1 11 8H2"/><path d="M12.59 19.41A2 2 0 1 0 14 16H2"/><path d="M17.73 7.73A2.5 2.5 0 1 1 19.5 12H2"/>
+        </svg>
+        <span>Air Quality Check</span>
+      </a>
+      <nav class="nav" aria-label="Sections">
+        <a href="#check">Check</a>
+        <a href="#history">History</a>
+        <a href="#guide">Guide</a>
+      </nav>
+      <button type="button" class="icon-btn" id="theme-btn" aria-label="Toggle light and dark theme">
+        <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="container" id="top">
+    <section class="hero">
+      <p class="eyebrow">Machine-learning prediction</p>
+      <h1>Is the air <em>good</em> or <em>poor</em>? Enter nine readings and find out.</h1>
+      <p>Set each value with the slider or type it exactly. The shape on the right updates as you go, and the trained model classifies the result when you run the check.</p>
+    </section>
+
+    <div class="workspace" id="check">
+      <!-- ============ Inputs ============ -->
+      <section aria-labelledby="readings-title">
+        <div class="section-head">
+          <h2 id="readings-title">Readings</h2>
+          <p>Slider ranges are a convenience. Type any value you need.</p>
+        </div>
+
+        <form id="predict-form" action="/predict" method="POST" novalidate>
+          <div class="fields" id="fields">
+            {% for name, short, label, desc, max, step in fields %}
+            <div class="field" data-key="{{ name }}" data-short="{{ short }}" data-label="{{ label }}" data-max="{{ max }}" data-step="{{ step }}" style="--i: {{ loop.index0 }}">
+              <div class="field-top">
+                <span class="chip">{{ short }}</span>
+                <label for="{{ name }}">{{ label }}</label>
+                <button type="button" class="info-btn" aria-expanded="false" aria-controls="{{ name }}-info" aria-label="About {{ label }}">i</button>
+              </div>
+              <p class="info" id="{{ name }}-info" hidden>{{ desc }}</p>
+              <input class="num" type="number" id="{{ name }}" name="{{ name }}"
+                     value="{{ request.form.get(name, '') }}"
+                     placeholder="0" step="any" min="0" inputmode="decimal" required>
+              <input class="slider" type="range" min="0" max="{{ max }}" step="{{ step }}" value="0"
+                     aria-label="{{ label }} slider" tabindex="-1">
+              <div class="scale" aria-hidden="true"><span>0</span><span>{{ max }}</span></div>
+            </div>
+            {% endfor %}
+          </div>
+          <p id="form-msg" class="form-msg" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <!-- ============ Result + radar ============ -->
+      <aside class="panel" aria-label="Result">
+        <div class="actions">
+          <button type="submit" form="predict-form" id="submit-btn" class="btn btn-primary">
+            <span class="spinner" aria-hidden="true"></span><span id="submit-label">Check air quality</span>
+          </button>
+          <button type="button" class="btn" id="demo-btn">Fill demo values</button>
+          <button type="button" class="btn" id="clear-btn">Clear all</button>
+        </div>
+
+        <div class="card result {% if has_result %}pop{% endif %}" id="result" aria-live="polite">
+          <svg class="ring" viewBox="0 0 120 120" aria-hidden="true" id="ring">
+            <circle class="ring-track" cx="60" cy="60" r="52"/>
+            <circle class="ring-fg" cx="60" cy="60" r="52"/>
+            <g class="ic ic-idle"><path d="M42 60h36"/></g>
+            <g class="ic ic-good"><path d="M40 61l14 14 27-30"/></g>
+            <g class="ic ic-poor"><path d="M60 40v24M60 79v1"/></g>
+          </svg>
+          <div>
+            <p class="result-label">Prediction</p>
+            <p class="verdict" id="verdict">{% if has_result %}{{ 'Good' if is_good else 'Poor' }}{% else %}Waiting{% endif %}</p>
+            <p class="result-text" id="result-text">{% if has_result %}{{ prediction_text }}{% else %}Enter all nine readings, then run the check.{% endif %}</p>
+            <p class="result-meta"><b id="count">0</b> of 9 readings entered<span id="result-time"></span></p>
+          </div>
+        </div>
+
+        <div class="card radar-wrap" id="radar-card">
+          <h2>Your inputs at a glance</h2>
+          <p class="sub">Each axis is scaled to its slider range.</p>
+          <svg id="radar" viewBox="0 0 300 300" role="img" aria-label="Radar chart of the nine entered readings"></svg>
+        </div>
+      </aside>
+    </div>
+
+    <!-- ============ History ============ -->
+    <section class="block reveal" id="history" aria-labelledby="history-title">
+      <div class="section-head">
+        <h2 id="history-title">Recent checks</h2>
+        <button type="button" class="link-btn" id="history-clear" hidden>Clear history</button>
+      </div>
+      <p class="empty" id="history-empty">No checks yet. Results from this browser appear here.</p>
+      <ul class="history-list" id="history-list"></ul>
+    </section>
+
+    <!-- ============ Guide ============ -->
+    <section class="block reveal" id="guide" aria-labelledby="guide-title">
+      <div class="section-head"><h2 id="guide-title">How it works</h2></div>
+      <div class="steps">
+        <div class="step"><h3>Enter the readings</h3><p>Nine values are sent to the model in a fixed order. All of them are required.</p></div>
+        <div class="step"><h3>The model classifies</h3><p>A trained classifier returns one of two labels for that combination of values.</p></div>
+        <div class="step"><h3>Read the result</h3><p>The interface turns green for Good and orange for Poor. Past results stay in this browser.</p></div>
+      </div>
+      <div class="outcomes">
+        <div class="outcome good"><h3>Good</h3><p>The readings resemble conditions the model learned to label as good air quality.</p></div>
+        <div class="outcome poor"><h3>Poor</h3><p>The readings resemble conditions the model learned to label as poor air quality.</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">A machine-learning prediction, not an official air quality measurement.</div>
+  </footer>
+
+  <!-- Read by the script after an in-page submit; also holds the server text on a normal page load -->
+  <div id="server-result" data-text="{{ prediction_text if has_result else '' }}" hidden></div>
+
+  <script>
+  {% raw %}
+  (function () {
+    "use strict";
+
+    const body = document.body;
+    const form = document.getElementById("predict-form");
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const HISTORY_KEY = "aqi-history";
+
+    const fields = Array.from(document.querySelectorAll(".field")).map(function (el) {
+      const step = parseFloat(el.dataset.step);
+      return {
+        el: el,
+        key: el.dataset.key,
+        short: el.dataset.short,
+        label: el.dataset.label,
+        max: parseFloat(el.dataset.max),
+        decimals: step < 1 ? String(step).split(".")[1].length : 0,
+        num: el.querySelector(".num"),
+        range: el.querySelector(".slider"),
+        info: el.querySelector(".info"),
+        infoBtn: el.querySelector(".info-btn")
+      };
+    });
+
+    const $ = function (id) { return document.getElementById(id); };
+    const clamp = function (v, lo, hi) { return Math.min(hi, Math.max(lo, v)); };
+    const valueOf = function (f) { const v = parseFloat(f.num.value); return isNaN(v) ? null : v; };
+
+    /* ================= Background particles ================= */
+    const cv = $("bg");
+    const ctx = cv.getContext("2d");
+    let W = 0, H = 0, parts = [], bursts = [], pm = 0, rgb = [47, 128, 237];
+    const mouse = { x: -999, y: -999 };
+
+    function hexToRgb(h) {
+      h = h.trim().replace("#", "");
+      if (h.length === 3) { h = h.split("").map(function (c) { return c + c; }).join(""); }
+      const n = parseInt(h, 16);
+      return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+    function refreshAccent() {
+      const v = getComputedStyle(body).getPropertyValue("--accent");
+      if (v && v.trim().charAt(0) === "#") { rgb = hexToRgb(v); }
+    }
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      W = window.innerWidth; H = window.innerHeight;
+      cv.width = W * dpr; cv.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    function newPart() {
+      return { x: Math.random() * W, y: Math.random() * H, r: 1 + Math.random() * 2.6, vx: (Math.random() - 0.5) * 0.3, vy: -(0.1 + Math.random() * 0.3), a: 0.12 + Math.random() * 0.3 };
+    }
+    function wanted() {
+      const s = body.dataset.state;
+      return Math.round((s === "good" ? 45 : s === "poor" ? 90 : 60) + pm * 70);
+    }
+    function color(a) { return "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + a + ")"; }
+
+    function frame() {
+      ctx.clearRect(0, 0, W, H);
+      const s = body.dataset.state;
+      const want = wanted();
+      if (parts.length < want) { parts.push(newPart()); } else if (parts.length > want) { parts.pop(); }
+      const speed = s === "good" ? 1.6 : s === "poor" ? 0.6 : 1;
+      const drift = s === "poor" ? 0.35 : 0;
+      const size = s === "poor" ? 1.5 : 1;
+
+      const haze = ctx.createLinearGradient(0, H * 0.35, 0, H);
+      haze.addColorStop(0, color(0));
+      haze.addColorStop(1, color(0.03 + pm * (s === "poor" ? 0.16 : 0.09)));
+      ctx.fillStyle = haze;
+      ctx.fillRect(0, 0, W, H);
+
+      for (let i = 0; i < parts.length; i++) {
+        const p = parts[i];
+        const dx = p.x - mouse.x, dy = p.y - mouse.y, d2 = dx * dx + dy * dy;
+        if (d2 < 9000) {
+          const d = Math.sqrt(d2) || 1, f = (1 - d2 / 9000) * 2.4;
+          p.x += (dx / d) * f; p.y += (dy / d) * f;
+        }
+        p.x += (p.vx + drift) * speed;
+        p.y += p.vy * speed * (s === "poor" ? 0.3 : 1);
+        if (p.x < -5) { p.x = W + 5; } else if (p.x > W + 5) { p.x = -5; }
+        if (p.y < -5) { p.y = H + 5; } else if (p.y > H + 5) { p.y = -5; }
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * size, 0, Math.PI * 2);
+        ctx.fillStyle = color(p.a);
+        ctx.fill();
+      }
+
+      bursts = bursts.filter(function (b) { return b.life > 0; });
+      for (let i = 0; i < bursts.length; i++) {
+        const b = bursts[i];
+        b.x += b.vx; b.y += b.vy; b.vx *= 0.97; b.vy *= 0.97; b.life -= 0.018;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 2.2, 0, Math.PI * 2);
+        ctx.fillStyle = color(Math.max(0, b.life) * 0.8);
+        ctx.fill();
+      }
+      requestAnimationFrame(frame);
+    }
+
+    function burst(el) {
+      if (reduce) { return; }
+      const r = el.getBoundingClientRect();
+      const cx = r.left + 50, cy = r.top + r.height / 2;
+      for (let i = 0; i < 44; i++) {
+        const a = Math.random() * Math.PI * 2, sp = 1 + Math.random() * 4;
+        bursts.push({ x: cx, y: cy, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 1 });
+      }
+    }
+
+    if (reduce) {
+      cv.hidden = true;
+    } else {
+      resize();
+      window.addEventListener("resize", resize);
+      window.addEventListener("pointermove", function (e) { mouse.x = e.clientX; mouse.y = e.clientY; });
+      refreshAccent();
+      requestAnimationFrame(frame);
+    }
+
+    /* ================= Radar chart ================= */
+    const NS = "http://www.w3.org/2000/svg";
+    const radar = $("radar");
+    const CX = 150, CY = 150, R = 92, N = fields.length;
+    const cur = fields.map(function () { return 0; });
+    const tgt = fields.map(function () { return 0; });
+    let radarRaf = null;
+    let poly, dots = [];
+
+    function polar(i, r) {
+      const a = -Math.PI / 2 + (i * 2 * Math.PI) / N;
+      return [CX + r * Math.cos(a), CY + r * Math.sin(a)];
+    }
+    function mk(tag, attrs, parent) {
+      const el = document.createElementNS(NS, tag);
+      Object.keys(attrs).forEach(function (k) { el.setAttribute(k, attrs[k]); });
+      parent.appendChild(el);
+      return el;
+    }
+    function buildRadar() {
+      [0.25, 0.5, 0.75, 1].forEach(function (lv) {
+        const pts = fields.map(function (_, i) { return polar(i, R * lv).join(","); }).join(" ");
+        mk("polygon", { points: pts, "class": "r-grid" }, radar);
+      });
+      fields.forEach(function (f, i) {
+        const p = polar(i, R), l = polar(i, R + 17);
+        mk("line", { x1: CX, y1: CY, x2: p[0], y2: p[1], "class": "r-axis" }, radar);
+        const t = mk("text", { x: l[0], y: l[1], "class": "r-label", "text-anchor": Math.abs(l[0] - CX) < 6 ? "middle" : l[0] > CX ? "start" : "end", "dominant-baseline": "middle" }, radar);
+        t.textContent = f.short;
+      });
+      poly = mk("polygon", { points: "", "class": "r-poly" }, radar);
+      fields.forEach(function (f) {
+        const c = mk("circle", { r: 4, "class": "r-dot" }, radar);
+        c.appendChild(document.createElementNS(NS, "title"));
+        dots.push(c);
+      });
+      drawRadar();
+    }
+    function drawRadar() {
+      const pts = [];
+      for (let i = 0; i < N; i++) {
+        const p = polar(i, R * cur[i]);
+        pts.push(p.join(","));
+        dots[i].setAttribute("cx", p[0]);
+        dots[i].setAttribute("cy", p[1]);
+      }
+      poly.setAttribute("points", pts.join(" "));
+    }
+    function animateRadar() {
+      let moving = false;
+      for (let i = 0; i < N; i++) {
+        const d = tgt[i] - cur[i];
+        if (Math.abs(d) > 0.003 && !reduce) { cur[i] += d * 0.2; moving = true; } else { cur[i] = tgt[i]; }
+      }
+      drawRadar();
+      radarRaf = moving ? requestAnimationFrame(animateRadar) : null;
+    }
+
+    /* ================= Field syncing ================= */
+    function syncField(f, fromRange) {
+      if (fromRange) {
+        f.num.value = (+f.range.value).toFixed(f.decimals);
+      }
+      const v = valueOf(f);
+      const pct = v === null ? 0 : clamp(v / f.max, 0, 1) * 100;
+      f.range.value = v === null ? 0 : Math.min(v, f.max);
+      f.range.style.setProperty("--pct", pct + "%");
+      f.el.classList.toggle("filled", v !== null);
+      f.el.classList.remove("invalid");
+    }
+
+    function update() {
+      let filled = 0;
+      fields.forEach(function (f, i) {
+        const v = valueOf(f);
+        if (v !== null) { filled++; }
+        tgt[i] = v === null ? 0 : clamp(v / f.max, 0, 1);
+        dots[i].firstChild.textContent = f.label + ": " + (v === null ? "not entered" : v);
+      });
+      $("count").textContent = filled;
+      $("ring").style.setProperty("--p", filled / N);
+      const pmFrac = Math.max(tgt[0], tgt[1]);
+      pm = pmFrac;
+      if (!radarRaf) { radarRaf = requestAnimationFrame(animateRadar); }
+      $("form-msg").hidden = true;
+    }
+
+    fields.forEach(function (f) {
+      f.num.addEventListener("input", function () { syncField(f, false); update(); });
+      f.range.addEventListener("input", function () { syncField(f, true); update(); });
+      f.infoBtn.addEventListener("click", function () {
+        const open = f.info.hidden;
+        f.info.hidden = !open;
+        f.infoBtn.setAttribute("aria-expanded", String(open));
+      });
+      f.el.addEventListener("pointermove", function (e) {
+        const r = f.el.getBoundingClientRect();
+        f.el.style.setProperty("--mx", e.clientX - r.left + "px");
+        f.el.style.setProperty("--my", e.clientY - r.top + "px");
+      });
+    });
+
+    function setValues(values) {
+      fields.forEach(function (f) {
+        const v = values[f.key];
+        f.num.value = v === undefined || v === null ? "" : v;
+        syncField(f, false);
+      });
+      update();
+    }
+
+    $("demo-btn").addEventListener("click", function () {
+      const vals = {};
+      fields.forEach(function (f) {
+        const raw = f.max * (0.05 + Math.random() * 0.6);
+        vals[f.key] = raw.toFixed(f.decimals);
+      });
+      setValues(vals);
+    });
+
+    $("clear-btn").addEventListener("click", function () {
+      setValues({});
+      fields[0].num.focus();
+    });
+
+    /* ================= Result handling ================= */
+    function setState(state) {
+      body.dataset.state = state;
+      refreshAccent();
+    }
+    function stamp() {
+      $("result-time").textContent = " · " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    function popResult() {
+      const card = $("result");
+      card.classList.remove("pop");
+      void card.offsetWidth;
+      card.classList.add("pop");
+      burst(card);
+      if (window.matchMedia("(max-width: 980px)").matches) {
+        card.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+      }
+    }
+    function showResult(text, good) {
+      setState(good ? "good" : "poor");
+      $("verdict").textContent = good ? "Good" : "Poor";
+      $("result-text").textContent = text;
+      stamp();
+      popResult();
+      addHistory(text, good);
+    }
+    function showError(msg) {
+      setState("error");
+      $("verdict").textContent = "No result";
+      $("result-text").textContent = msg;
+      stamp();
+      popResult();
+    }
+
+    /* ================= History (browser storage) ================= */
+    function loadHistory() {
+      try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; } catch (e) { return []; }
+    }
+    function saveHistory(list) {
+      try { localStorage.setItem(HISTORY_KEY, JSON.stringify(list)); } catch (e) {}
+    }
+    function currentValues() {
+      const v = {};
+      fields.forEach(function (f) { v[f.key] = f.num.value; });
+      return v;
+    }
+    function addHistory(text, good) {
+      const list = loadHistory();
+      const values = currentValues();
+      const last = list[0];
+      if (last && JSON.stringify(last.v) === JSON.stringify(values) && last.good === good) { return; }
+      list.unshift({ t: Date.now(), good: good, text: text, v: values });
+      saveHistory(list.slice(0, 6));
+      renderHistory();
+    }
+    function renderHistory() {
+      const list = loadHistory();
+      const ul = $("history-list");
+      ul.innerHTML = "";
+      $("history-empty").hidden = list.length > 0;
+      $("history-clear").hidden = list.length === 0;
+      list.forEach(function (item, i) {
+        const li = document.createElement("li");
+        li.className = "h-item";
+        li.style.animationDelay = i * 50 + "ms";
+
+        const top = document.createElement("div");
+        top.className = "h-top";
+        const badge = document.createElement("span");
+        badge.className = "badge " + (item.good ? "good" : "poor");
+        badge.textContent = item.good ? "Good" : "Poor";
+        const time = document.createElement("span");
+        time.className = "h-time";
+        time.textContent = new Date(item.t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+        top.appendChild(badge); top.appendChild(time);
+
+        const vals = document.createElement("p");
+        vals.className = "h-vals";
+        vals.textContent = ["pm2_5", "pm10", "ozone"].map(function (k) {
+          const f = fields.filter(function (x) { return x.key === k; })[0];
+          return f.short + " " + (item.v[k] === "" || item.v[k] === undefined ? "n/a" : item.v[k]);
+        }).join(" · ");
+
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "link-btn";
+        btn.textContent = "Load these readings";
+        btn.addEventListener("click", function () {
+          setValues(item.v);
+          document.getElementById("check").scrollIntoView({ behavior: reduce ? "auto" : "smooth" });
+        });
+
+        li.appendChild(top); li.appendChild(vals); li.appendChild(btn);
+        ul.appendChild(li);
+      });
+    }
+    $("history-clear").addEventListener("click", function () { saveHistory([]); renderHistory(); });
+
+    /* ================= Submit (in-page, falls back to normal POST) ================= */
+    const submitBtn = $("submit-btn");
+    const submitLabel = $("submit-label");
+
+    function setLoading(on) {
+      submitBtn.disabled = on;
+      submitBtn.classList.toggle("loading", on);
+      submitLabel.textContent = on ? "Analysing..." : "Check air quality";
+      $("radar-card").classList.toggle("scanning", on);
+    }
+
+    form.addEventListener("submit", function (event) {
+      const bad = fields.filter(function (f) { const v = valueOf(f); return v === null || v < 0; });
+      if (bad.length) {
+        event.preventDefault();
+        bad.forEach(function (f) { f.el.classList.remove("invalid"); void f.el.offsetWidth; f.el.classList.add("invalid"); });
+        const msg = $("form-msg");
+        msg.textContent = "Enter a number of 0 or more in " + (bad.length === 1 ? "this field" : "all " + bad.length + " highlighted fields") + ".";
+        msg.hidden = false;
+        bad[0].num.focus();
+        bad[0].el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
+        return;
+      }
+      if (!window.fetch || !window.DOMParser || !window.FormData) { return; }
+
+      event.preventDefault();
+      setLoading(true);
+      fetch(form.action, { method: "POST", body: new FormData(form) })
+        .then(function (res) {
+          if (!res.ok) { throw new Error("The server returned status " + res.status + ". Check the Flask terminal for details."); }
+          return res.text();
+        })
+        .then(function (html) {
+          const doc = new DOMParser().parseFromString(html, "text/html");
+          const el = doc.getElementById("server-result");
+          const text = el ? el.getAttribute("data-text") : "";
+          if (!text) { throw new Error("The server response did not contain a prediction."); }
+          showResult(text, /good/i.test(text));
+        })
+        .catch(function (err) {
+          showError(err.message || "Could not reach the server.");
+        })
+        .then(function () { setLoading(false); });
+    });
+
+    window.addEventListener("pageshow", function () { setLoading(false); });
+
+    /* ================= Theme ================= */
+    $("theme-btn").addEventListener("click", function () {
+      const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("aqi-theme", next); } catch (e) {}
+      refreshAccent();
+    });
+
+    /* ================= Scroll reveal ================= */
+    if ("IntersectionObserver" in window && !reduce) {
+      const io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } });
+      }, { threshold: 0.12 });
+      document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
+    } else {
+      document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
+    }
+
+    /* ================= Init ================= */
+    buildRadar();
+    fields.forEach(function (f) { syncField(f, false); });
+    update();
+
+    const serverText = $("server-result").getAttribute("data-text");
+    if (serverText) {
+      stamp();
+      addHistory(serverText, /good/i.test(serverText));
+      popResult();
+    }
+    renderHistory();
+    refreshAccent();
+  })();
+  {% endraw %}
+  </script>
+</body>
+</html>
